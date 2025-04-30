@@ -6,16 +6,18 @@ import asyncio
 import os
 import logging
 
-from fastapi import FastAPI, Form, File, UploadFile, Request, Query
+from fastapi import FastAPI, Form, File, UploadFile, Request, Query, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from pydantic import BaseModel, Field
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
 import aioboto3
 import boto3
 
+import secrets
 
 # Configure logging
 logging.basicConfig(
@@ -23,6 +25,19 @@ logging.basicConfig(
     level=logging.INFO,          # Log level
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+security = HTTPBasic()
+
+# def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
+#     correct_username = secrets.compare_digest(credentials.username, API_USERNAME)
+#     correct_password = secrets.compare_digest(credentials.password, API_PASSWORD)
+#     if not (correct_username and correct_password):
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Invalid authentication credentials",
+#             headers={"WWW-Authenticate": "Basic"},
+#         )
+#     return credentials.username
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +98,8 @@ AWS_ACCESS_KEY_ID = aws_credentials['AWS_ACCESS_KEY_ID']
 AWS_SECRET_ACCESS_KEY = aws_credentials['AWS_SECRET_ACCESS_KEY']
 AWS_REGION = aws_credentials['AWS_REGION']
 AWS_URL_ENDPOINT = aws_credentials['AWS_URL_ENDPOINT']
+API_USERNAME = aws_credentials['API_USERNAME']
+API_PASSWORD = aws_credentials['API_PASSWORD']
 
 CONCURRENCY_LIMIT = 200 # Adjust this value based on your server capabilities
 
@@ -142,13 +159,11 @@ class NewDeployment(BaseModel):
 
 @app.get("/", include_in_schema=False)
 async def main():
-    return RedirectResponse(url="/ami-data-upload/docs") # docs
-
+    return RedirectResponse(url="docs") # docs or /ami-data-upload/docs
 
 @app.get("/get-deployments/", tags=["Deployments"])
-async def get_deployments():
+async def get_deployments(username: str = Depends(authenticate)):
     return JSONResponse(content=deployments_info)
-
 
 def increment_id(data, current_id):
     id_list = []
@@ -167,7 +182,7 @@ def increment_id(data, current_id):
 
 
 @app.post("/create-deployment/", tags=["Deployments"])
-async def create_deployment(new_deployment: NewDeployment):
+async def create_deployment(new_deployment: NewDeployment, username: str = Depends(authenticate)):
     try:
         global deployments_info
         # Append the new deployment to the CSV file
@@ -202,7 +217,7 @@ async def create_deployment(new_deployment: NewDeployment):
 
 
 @app.put("/update-deployment/", tags=["Deployments"])
-async def update_deployment(deployment: Deployment):
+async def update_deployment(deployment: Deployment, username: str = Depends(authenticate)):
     try:
         # Reload deployments info
         global deployments_info
@@ -234,7 +249,8 @@ async def update_deployment(deployment: Deployment):
 async def list_data(
         country_location_name: str = Query("", enum=sorted(list(valid_countries_location_names)),
                                            description="Country and location names."),
-        data_type: str = Query("", enum=list(valid_data_types), description="")
+        data_type: str = Query("", enum=list(valid_data_types), description=""),
+        username: str = Depends(authenticate)
 ):
     country, location_name = country_location_name.split(" - ")
     country_code = [d['country_code'] for d in deployments_info if d['country'] == country][0]
@@ -268,7 +284,8 @@ async def list_data(
 async def count_data(
         country_location_name: str = Query("", enum=sorted(list(valid_countries_location_names)),
                                            description="Country and location names."),
-        data_type: str = Query("", enum=list(valid_data_types), description="")
+        data_type: str = Query("", enum=list(valid_data_types), description=""),
+        username: str = Depends(authenticate)
 ):
     country, location_name = country_location_name.split(" - ")
     country_code = [d['country_code'] for d in deployments_info if d['country'] == country][0]
@@ -304,7 +321,7 @@ async def count_data(
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.get("/logs/", tags=["Other"])
-async def get_logs():
+async def get_logs(username: str = Depends(authenticate)):
     try:
         with open('upload_logs.log', 'r') as log_file:
             log_content = log_file.read()
@@ -317,7 +334,8 @@ async def get_logs():
 async def create_bucket(bucket_name: str = Query("", description="Bucket are named based on countries "
                                                                  "Alpha-3 code, check this link: "
                                                                  "https://www.iban.com/country-codes. "
-                                                                 "E.g. The United Kingdom would be gbr")):
+                                                                 "E.g. The United Kingdom would be gbr"),
+                                                                 username: str = Depends(authenticate)):
     async with session.client('s3',
                               aws_access_key_id=AWS_ACCESS_KEY_ID,
                               aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -341,7 +359,8 @@ async def generate_presigned_url(
     deployment: str = Form(...),
     data_type: str = Form(...),
     filename: str = Form(...),
-    file_type: str = Form(...)
+    file_type: str = Form(...),
+    username: str = Depends(authenticate)
     ):
     bucket_name = country.lower()
     key = f"{deployment}/{data_type}/{filename}"
@@ -373,7 +392,8 @@ async def upload(
         country: str = Form(...),
         deployment: str = Form(...),
         data_type: str = Form(...),
-        files: List[UploadFile] = File(...)
+        files: List[UploadFile] = File(...),
+        username: str = Depends(authenticate)
 ):
     start_time = perf_counter()
     s3_bucket_name = country.lower()
@@ -413,7 +433,8 @@ async def check_file_exist(
     country: str = Form(...),
     deployment: str = Form(...),
     data_type: str = Form(...),
-    filename: str = Form(...)
+    filename: str = Form(...),
+    username: str = Depends(authenticate)
 ):
     bucket_name = country.lower()
     key = f"{deployment}/{data_type}/{filename}"
