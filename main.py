@@ -19,6 +19,8 @@ import boto3
 
 import secrets
 
+from typing import Annotated
+
 # Configure logging
 logging.basicConfig(
     filename='upload_logs.log',  # Log file path on the server
@@ -28,16 +30,37 @@ logging.basicConfig(
 
 security = HTTPBasic()
 
-# def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
-#     correct_username = secrets.compare_digest(credentials.username, API_USERNAME)
-#     correct_password = secrets.compare_digest(credentials.password, API_PASSWORD)
-#     if not (correct_username and correct_password):
-#         raise HTTPException(
-#             status_code=status.HTTP_401_UNAUTHORIZED,
-#             detail="Invalid authentication credentials",
-#             headers={"WWW-Authenticate": "Basic"},
-#         )
-#     return credentials.username
+# Load AWS credentials and S3 bucket name from config file
+with open('credentials.json') as config_file:
+    aws_credentials = json.load(config_file)
+
+AWS_ACCESS_KEY_ID = aws_credentials['AWS_ACCESS_KEY_ID']
+AWS_SECRET_ACCESS_KEY = aws_credentials['AWS_SECRET_ACCESS_KEY']
+AWS_REGION = aws_credentials['AWS_REGION']
+AWS_URL_ENDPOINT = aws_credentials['AWS_URL_ENDPOINT']
+API_USERNAME = aws_credentials['API_USERNAME']
+API_PASSWORD = aws_credentials['API_PASSWORD']
+
+def authenticate(
+    credentials: Annotated[HTTPBasicCredentials, Depends(security)],
+):
+    current_username_bytes = credentials.username.encode("utf8")
+    correct_username_bytes = API_USERNAME.encode('utf-8')
+    is_correct_username = secrets.compare_digest(
+        current_username_bytes, correct_username_bytes
+    )
+    current_password_bytes = credentials.password.encode("utf8")
+    correct_password_bytes = API_PASSWORD.encode('utf-8')
+    is_correct_password = secrets.compare_digest(
+        current_password_bytes, correct_password_bytes
+    )
+    if not (is_correct_username and is_correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
 
 logger = logging.getLogger(__name__)
 
@@ -88,18 +111,6 @@ app.add_middleware(
 )
 # Mount the static directory to serve static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-# Load AWS credentials and S3 bucket name from config file
-with open('credentials.json') as config_file:
-    aws_credentials = json.load(config_file)
-
-AWS_ACCESS_KEY_ID = aws_credentials['AWS_ACCESS_KEY_ID']
-AWS_SECRET_ACCESS_KEY = aws_credentials['AWS_SECRET_ACCESS_KEY']
-AWS_REGION = aws_credentials['AWS_REGION']
-AWS_URL_ENDPOINT = aws_credentials['AWS_URL_ENDPOINT']
-API_USERNAME = aws_credentials['API_USERNAME']
-API_PASSWORD = aws_credentials['API_PASSWORD']
 
 CONCURRENCY_LIMIT = 200 # Adjust this value based on your server capabilities
 
@@ -156,10 +167,9 @@ class NewDeployment(BaseModel):
 #         html_content = f.read()
 #     return HTMLResponse(content=html_content)
 
-
 @app.get("/", include_in_schema=False)
 async def main():
-    return RedirectResponse(url="docs") # docs or /ami-data-upload/docs
+    return RedirectResponse(url="/ami-data-upload/docs") # docs or /ami-data-upload/docs#
 
 @app.get("/get-deployments/", tags=["Deployments"])
 async def get_deployments(username: str = Depends(authenticate)):
