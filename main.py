@@ -10,7 +10,6 @@ from fastapi import FastAPI, Form, File, UploadFile, Request, Query, Depends, HT
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from pydantic import BaseModel, Field
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
@@ -28,7 +27,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-security = HTTPBasic()
+token = secrets.token_urlsafe(32)
+
+active_tokens = {}
 
 # Load AWS credentials and S3 bucket name from config file
 with open('credentials.json') as config_file:
@@ -40,27 +41,6 @@ AWS_REGION = aws_credentials['AWS_REGION']
 AWS_URL_ENDPOINT = aws_credentials['AWS_URL_ENDPOINT']
 API_USERNAME = aws_credentials['API_USERNAME']
 API_PASSWORD = aws_credentials['API_PASSWORD']
-
-def authenticate(
-    credentials: Annotated[HTTPBasicCredentials, Depends(security)],
-):
-    current_username_bytes = credentials.username.encode("utf8")
-    correct_username_bytes = API_USERNAME.encode('utf-8')
-    is_correct_username = secrets.compare_digest(
-        current_username_bytes, correct_username_bytes
-    )
-    current_password_bytes = credentials.password.encode("utf8")
-    correct_password_bytes = API_PASSWORD.encode('utf-8')
-    is_correct_password = secrets.compare_digest(
-        current_password_bytes, correct_password_bytes
-    )
-    if not (is_correct_username and is_correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +140,6 @@ class NewDeployment(BaseModel):
     hardware_id: str
     status: str = Field(default="inactive")
 
-
 # @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 # async def main():
 #     with open("templates/upload.html") as f:
@@ -171,8 +150,26 @@ class NewDeployment(BaseModel):
 async def main():
     return RedirectResponse(url="/ami-data-upload/docs") # docs or /ami-data-upload/docs#
 
+@app.post("/login", tags=["Other"])
+async def login(username: str = Form(...), password: str = Form(...)):
+    is_valid_user = secrets.compare_digest(username.encode("utf-8"), API_USERNAME.encode("utf-8"))
+    is_valid_pass = secrets.compare_digest(password.encode("utf-8"), API_PASSWORD.encode("utf-8"))
+
+    if is_valid_user and is_valid_pass:
+        token = secrets.token_urlsafe(32)
+        active_tokens[token] = username
+        return JSONResponse(content={"token": token})
+
+    raise HTTPException(status_code=401, detail="Invalid username or password")
+
+def validate_token(token: str = Query(...)):
+    username = active_tokens.get(token)
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return username
+
 @app.get("/get-deployments/", tags=["Deployments"])
-async def get_deployments(username: str = Depends(authenticate)):
+async def get_deployments(username: str = Depends(validate_token)):
     return JSONResponse(content=deployments_info)
 
 def increment_id(data, current_id):
@@ -192,7 +189,7 @@ def increment_id(data, current_id):
 
 
 @app.post("/create-deployment/", tags=["Deployments"])
-async def create_deployment(new_deployment: NewDeployment, username: str = Depends(authenticate)):
+async def create_deployment(new_deployment: NewDeployment):
     try:
         global deployments_info
         # Append the new deployment to the CSV file
@@ -227,7 +224,7 @@ async def create_deployment(new_deployment: NewDeployment, username: str = Depen
 
 
 @app.put("/update-deployment/", tags=["Deployments"])
-async def update_deployment(deployment: Deployment, username: str = Depends(authenticate)):
+async def update_deployment(deployment: Deployment):
     try:
         # Reload deployments info
         global deployments_info
@@ -259,8 +256,7 @@ async def update_deployment(deployment: Deployment, username: str = Depends(auth
 async def list_data(
         country_location_name: str = Query("", enum=sorted(list(valid_countries_location_names)),
                                            description="Country and location names."),
-        data_type: str = Query("", enum=list(valid_data_types), description=""),
-        username: str = Depends(authenticate)
+        data_type: str = Query("", enum=list(valid_data_types), description="")
 ):
     country, location_name = country_location_name.split(" - ")
     country_code = [d['country_code'] for d in deployments_info if d['country'] == country][0]
@@ -294,8 +290,7 @@ async def list_data(
 async def count_data(
         country_location_name: str = Query("", enum=sorted(list(valid_countries_location_names)),
                                            description="Country and location names."),
-        data_type: str = Query("", enum=list(valid_data_types), description=""),
-        username: str = Depends(authenticate)
+        data_type: str = Query("", enum=list(valid_data_types), description="")
 ):
     country, location_name = country_location_name.split(" - ")
     country_code = [d['country_code'] for d in deployments_info if d['country'] == country][0]
@@ -331,7 +326,7 @@ async def count_data(
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.get("/logs/", tags=["Other"])
-async def get_logs(username: str = Depends(authenticate)):
+async def get_logs():
     try:
         with open('upload_logs.log', 'r') as log_file:
             log_content = log_file.read()
@@ -344,8 +339,7 @@ async def get_logs(username: str = Depends(authenticate)):
 async def create_bucket(bucket_name: str = Query("", description="Bucket are named based on countries "
                                                                  "Alpha-3 code, check this link: "
                                                                  "https://www.iban.com/country-codes. "
-                                                                 "E.g. The United Kingdom would be gbr"),
-                                                                 username: str = Depends(authenticate)):
+                                                                 "E.g. The United Kingdom would be gbr")):
     async with session.client('s3',
                               aws_access_key_id=AWS_ACCESS_KEY_ID,
                               aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -369,8 +363,7 @@ async def generate_presigned_url(
     deployment: str = Form(...),
     data_type: str = Form(...),
     filename: str = Form(...),
-    file_type: str = Form(...),
-    username: str = Depends(authenticate)
+    file_type: str = Form(...)
     ):
     bucket_name = country.lower()
     key = f"{deployment}/{data_type}/{filename}"
@@ -402,8 +395,7 @@ async def upload(
         country: str = Form(...),
         deployment: str = Form(...),
         data_type: str = Form(...),
-        files: List[UploadFile] = File(...),
-        username: str = Depends(authenticate)
+        files: List[UploadFile] = File(...)
 ):
     start_time = perf_counter()
     s3_bucket_name = country.lower()
@@ -443,8 +435,7 @@ async def check_file_exist(
     country: str = Form(...),
     deployment: str = Form(...),
     data_type: str = Form(...),
-    filename: str = Form(...),
-    username: str = Depends(authenticate)
+    filename: str = Form(...)
 ):
     bucket_name = country.lower()
     key = f"{deployment}/{data_type}/{filename}"
