@@ -20,16 +20,14 @@ import secrets
 
 from typing import Annotated
 
+from enum import Enum
+
 # Configure logging
 logging.basicConfig(
     filename='upload_logs.log',  # Log file path on the server
     level=logging.INFO,          # Log level
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
-token = secrets.token_urlsafe(32)
-
-active_tokens = {}
 
 # Load AWS credentials and S3 bucket name from config file
 with open('credentials.json') as config_file:
@@ -140,6 +138,10 @@ class NewDeployment(BaseModel):
     hardware_id: str
     status: str = Field(default="inactive")
 
+class DeploymentStatus(str, Enum):
+    active = "active"
+    inactive = "inactive"
+
 # @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 # async def main():
 #     with open("templates/upload.html") as f:
@@ -148,28 +150,19 @@ class NewDeployment(BaseModel):
 
 @app.get("/", include_in_schema=False)
 async def main():
-    return RedirectResponse(url="/ami-data-upload/docs") # docs or /ami-data-upload/docs#
+    return RedirectResponse(url="docs") # docs or /ami-data-upload/docs#
 
-@app.post("/login", tags=["Other"])
-async def login(username: str = Form(...), password: str = Form(...)):
-    is_valid_user = secrets.compare_digest(username.encode("utf-8"), API_USERNAME.encode("utf-8"))
-    is_valid_pass = secrets.compare_digest(password.encode("utf-8"), API_PASSWORD.encode("utf-8"))
-
-    if is_valid_user and is_valid_pass:
-        token = secrets.token_urlsafe(32)
-        active_tokens[token] = username
-        return JSONResponse(content={"token": token})
-
-    raise HTTPException(status_code=401, detail="Invalid username or password")
-
-def validate_token(token: str = Query(...)):
-    username = active_tokens.get(token)
-    if not username:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+def validate_credentials(
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    if not (secrets.compare_digest(username, API_USERNAME) and
+            secrets.compare_digest(password, API_PASSWORD)):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
     return username
 
-@app.get("/get-deployments/", tags=["Deployments"])
-async def get_deployments(username: str = Depends(validate_token)):
+@app.post("/get-deployments/", tags=["Deployments"])
+async def get_deployments(username: str = Depends(validate_credentials)):
     return JSONResponse(content=deployments_info)
 
 def increment_id(data, current_id):
@@ -189,7 +182,17 @@ def increment_id(data, current_id):
 
 
 @app.post("/create-deployment/", tags=["Deployments"])
-async def create_deployment(new_deployment: NewDeployment):
+async def create_deployment(
+    country: str = Form(...),
+    country_code: str = Form(...),
+    location_name: str = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
+    camera_id: str = Form(...),
+    hardware_id: str = Form(...),
+    status: DeploymentStatus = Form(DeploymentStatus.inactive),
+    username: str = Depends(validate_credentials)
+    ):
     try:
         global deployments_info
         # Append the new deployment to the CSV file
@@ -199,17 +202,19 @@ async def create_deployment(new_deployment: NewDeployment):
             # TODO: check is camera id already exists
             system_id = increment_id(deployments_info, 'system_id')
             deployment_id = increment_id(deployments_info, 'deployment_id')
-            deployment = Deployment(country=new_deployment.country,
-                                    country_code=new_deployment.country_code,
-                                    location_name=new_deployment.location_name,
-                                    lat=new_deployment.lat,
-                                    lon=new_deployment.lon,
-                                    location_id=location_id,
-                                    camera_id=new_deployment.camera_id,
-                                    system_id=system_id,
-                                    hardware_id=new_deployment.hardware_id,
-                                    deployment_id=deployment_id,
-                                    status=new_deployment.status)
+            deployment = Deployment(
+                country=country,
+                country_code=country_code,
+                location_name=location_name,
+                lat=lat,
+                lon=lon,
+                location_id=location_id,
+                camera_id=camera_id,
+                system_id=system_id,
+                hardware_id=hardware_id,
+                deployment_id=deployment_id,
+                status=status
+            )
             fieldnames = ['country', 'country_code', 'location_name', "lat", "lon", "location_id", 'camera_id',
                           "system_id", 'hardware_id', 'deployment_id', 'status']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -223,31 +228,56 @@ async def create_deployment(new_deployment: NewDeployment):
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 
-@app.put("/update-deployment/", tags=["Deployments"])
-async def update_deployment(deployment: Deployment):
+@app.post("/update-deployment/", tags=["Deployments"])
+async def update_deployment(
+    country: str = Form(...),
+    country_code: str = Form(...),
+    location_name: str = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
+    location_id: str = Form(...),
+    camera_id: str = Form(...),
+    system_id: str = Form(...),
+    hardware_id: str = Form(...),
+    deployment_id: str = Form(...),
+    status: DeploymentStatus = Form(DeploymentStatus.inactive),
+    username: str = Depends(validate_credentials)
+):
     try:
-        # Reload deployments info
         global deployments_info
 
-        # Find the deployment to update
-        for i, existing_deployment in enumerate(deployments_info):
-            if existing_deployment['deployment_id'] == deployment.deployment_id:
-                deployments_info[i] = deployment.dict()
-                break
-            if i == len(deployments_info)-1:
-                return JSONResponse(status_code=404, content={"message": "Deployment not found"})
+        # Construct dict manually from form fields
+        updated_deployment = {
+            "country": country,
+            "country_code": country_code,
+            "location_name": location_name,
+            "lat": lat,
+            "lon": lon,
+            "location_id": location_id,
+            "camera_id": camera_id,
+            "system_id": system_id,
+            "hardware_id": hardware_id,
+            "deployment_id": deployment_id,
+            "status": status
+        }
 
-        # Write the updated deployments back to the CSV file
-        with open('deployments_info.csv', 'w', newline='') as csvfile:
-            fieldnames = ['country', 'country_code', 'location_name', "lat", "lon", "location_id", 'camera_id',
-                          "system_id", 'hardware_id', 'deployment_id', 'status']
+        for i, existing_deployment in enumerate(deployments_info):
+            if existing_deployment["deployment_id"] == deployment_id:
+                deployments_info[i] = updated_deployment
+                break
+        else:
+            return JSONResponse(status_code=404, content={"message": "Deployment not found"})
+
+        # Write back to CSV
+        with open("deployments_info.csv", "w", newline='') as csvfile:
+            fieldnames = updated_deployment.keys()
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            for dep in deployments_info:
-                writer.writerow(dep)
+            writer.writerows(deployments_info)
 
         deployments_info = load_deployments_info()
         return JSONResponse(status_code=200, content={"message": "Deployment updated successfully"})
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"message": str(e)})
 
@@ -336,10 +366,10 @@ async def get_logs():
 
 
 @app.post("/create-bucket/", tags=["Other"])
-async def create_bucket(bucket_name: str = Query("", description="Bucket are named based on countries "
-                                                                 "Alpha-3 code, check this link: "
-                                                                 "https://www.iban.com/country-codes. "
-                                                                 "E.g. The United Kingdom would be gbr")):
+async def create_bucket(
+    bucket_name: str = Form(...),
+    username: str = Depends(validate_credentials)
+):
     async with session.client('s3',
                               aws_access_key_id=AWS_ACCESS_KEY_ID,
                               aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -363,7 +393,8 @@ async def generate_presigned_url(
     deployment: str = Form(...),
     data_type: str = Form(...),
     filename: str = Form(...),
-    file_type: str = Form(...)
+    file_type: str = Form(...),
+    username: str = Depends(validate_credentials)
     ):
     bucket_name = country.lower()
     key = f"{deployment}/{data_type}/{filename}"
@@ -395,7 +426,8 @@ async def upload(
         country: str = Form(...),
         deployment: str = Form(...),
         data_type: str = Form(...),
-        files: List[UploadFile] = File(...)
+        files: List[UploadFile] = File(...),
+        username: str = Depends(validate_credentials)
 ):
     start_time = perf_counter()
     s3_bucket_name = country.lower()
@@ -415,7 +447,7 @@ async def upload(
     return JSONResponse(status_code=200, content={"message": "All files uploaded and verified successfully"})
 
 
-async def upload_file(s3_bucket_name, key, file, name):
+async def upload_file(s3_bucket_name, key, file, name, username: str = Depends(validate_credentials)):
     async with session.client('s3',
                               aws_access_key_id=AWS_ACCESS_KEY_ID,
                               aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
