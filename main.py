@@ -107,8 +107,15 @@ deployments_info = load_deployments_info()
 valid_countries_names = {d['country'] for d in deployments_info if d['status'] == 'active'}
 valid_countries_location_names = {f"{d['country']} - {d['location_name']}" for d in deployments_info
                                   if d['status'] == 'active'}
-valid_data_types = {"snapshot_images", "audible_recordings", "ultrasound_recordings", "motion_images"} # DC add "motion images"
 
+valid_data_types = [
+    "snapshot_images",
+    "audible_recordings",
+    "ultrasound_recordings",
+    "motion_images",
+    "terrestrial_recordings",
+    "aquatic_recordings"
+]
 
 class UploadResponse(BaseModel):
     uploaded_files: List[str]
@@ -286,7 +293,7 @@ async def update_deployment(
 async def list_data(
         country_location_name: str = Query("", enum=sorted(list(valid_countries_location_names)),
                                            description="Country and location names."),
-        data_type: str = Query("", enum=list(valid_data_types), description="")
+        data_type: str = Query("", enum=valid_data_types, description="")
 ):
     country, location_name = country_location_name.split(" - ")
     country_code = [d['country_code'] for d in deployments_info if d['country'] == country][0]
@@ -320,7 +327,7 @@ async def list_data(
 async def count_data(
         country_location_name: str = Query("", enum=sorted(list(valid_countries_location_names)),
                                            description="Country and location names."),
-        data_type: str = Query("", enum=list(valid_data_types), description="")
+        data_type: str = Query("", enum=valid_data_types, description="")
 ):
     country, location_name = country_location_name.split(" - ")
     country_code = [d['country_code'] for d in deployments_info if d['country'] == country][0]
