@@ -341,6 +341,12 @@ async def upload_files_in_batches(name, bucket, dep_id, data_type, files, batch_
             files = files_to_upload  # Re-check the files that were missing in the first attempt
 
 ```
+### Partners email list
+
+Below are all of the partner contacts:
+
+Eduardo Navarro-Valencia <eduardoanv10@gmail.com>; Rungtip Wonglersak <Rungtip.W@nsm.or.th>; Hannah Risser <hrisser@ceh.ac.uk>; alex mutinda <alecksers@gmail.com>; Ng Wan Lin <wanlin.ng@ntu.edu.sg>; Farah Mukhida <fmukhida@axanationaltrust.com>; s.hotes.25t Chuo University <s.hotes.25t@g.chuo-u.ac.jp>; Christopher Andrews <chan@ceh.ac.uk>; Matthew Cornwell <matthew.cornwell@surreywt.org.uk>; Sabine Hoppe-Speer <sabine.hoppespeer@gmail.com>; Paul Bett <bettpaul6@gmail.com>; 'Esteban Brenes Artavia' <esteban.brenes@tropicalstudies.org>; Sofía Rodríguez <sofia.rodriguez@tropicalstudies.org>; Miguel Youngs <miguelyoungs9811@gmail.com>; amethbonilla34@gmail.com; Tazu Industries <ralf@generalsup.com>
+
 
 ## Setup
 
