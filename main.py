@@ -25,7 +25,7 @@ from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-USE_LOCAL = FALSE
+USE_LOCAL = True
 doc_path = "docs" if USE_LOCAL else "/ami-data-upload/docs"
 
 # Configure logging
