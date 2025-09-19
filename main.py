@@ -6,7 +6,7 @@ import asyncio
 import os
 import logging
 
-from fastapi import FastAPI, Form, File, UploadFile, Request, Query
+from fastapi import FastAPI, Form, File, UploadFile, Request, Query, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +16,17 @@ from botocore.exceptions import NoCredentialsError, PartialCredentialsError, Cli
 import aioboto3
 import boto3
 
+import secrets
+
+from typing import Annotated
+
+from enum import Enum
+
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+
+USE_LOCAL = True
+doc_path = "docs" if USE_LOCAL else "/ami-data-upload/docs"
 
 # Configure logging
 logging.basicConfig(
@@ -23,6 +34,17 @@ logging.basicConfig(
     level=logging.INFO,          # Log level
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+# Load AWS credentials and S3 bucket name from config file
+with open('credentials.json') as config_file:
+    aws_credentials = json.load(config_file)
+
+AWS_ACCESS_KEY_ID = aws_credentials['AWS_ACCESS_KEY_ID']
+AWS_SECRET_ACCESS_KEY = aws_credentials['AWS_SECRET_ACCESS_KEY']
+AWS_REGION = aws_credentials['AWS_REGION']
+AWS_URL_ENDPOINT = aws_credentials['AWS_URL_ENDPOINT']
+API_USERNAME = aws_credentials['API_USERNAME']
+API_PASSWORD = aws_credentials['API_PASSWORD']
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +96,6 @@ app.add_middleware(
 # Mount the static directory to serve static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
-# Load AWS credentials and S3 bucket name from config file
-with open('credentials.json') as config_file:
-    aws_credentials = json.load(config_file)
-
-AWS_ACCESS_KEY_ID = aws_credentials['AWS_ACCESS_KEY_ID']
-AWS_SECRET_ACCESS_KEY = aws_credentials['AWS_SECRET_ACCESS_KEY']
-AWS_REGION = aws_credentials['AWS_REGION']
-AWS_URL_ENDPOINT = aws_credentials['AWS_URL_ENDPOINT']
-
 CONCURRENCY_LIMIT = 200 # Adjust this value based on your server capabilities
 
 session = aioboto3.Session()
@@ -101,8 +113,15 @@ deployments_info = load_deployments_info()
 valid_countries_names = {d['country'] for d in deployments_info if d['status'] == 'active'}
 valid_countries_location_names = {f"{d['country']} - {d['location_name']}" for d in deployments_info
                                   if d['status'] == 'active'}
-valid_data_types = {"snapshot_images", "audible_recordings", "ultrasound_recordings", "motion_images"} # DC add "motion images"
 
+valid_data_types = [
+    "snapshot_images",
+    "audible_recordings",
+    "ultrasound_recordings",
+    "motion_images",
+    "terrestrial_recordings",
+    "aquatic_recordings"
+]
 
 class UploadResponse(BaseModel):
     uploaded_files: List[str]
@@ -132,6 +151,9 @@ class NewDeployment(BaseModel):
     hardware_id: str
     status: str = Field(default="inactive")
 
+class DeploymentStatus(str, Enum):
+    active = "active"
+    inactive = "inactive"
 
 # @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 # async def main():
@@ -139,16 +161,22 @@ class NewDeployment(BaseModel):
 #         html_content = f.read()
 #     return HTMLResponse(content=html_content)
 
-
 @app.get("/", include_in_schema=False)
 async def main():
-    return RedirectResponse(url="/ami-data-upload/docs") # docs
+    return RedirectResponse(url=doc_path)
 
+def validate_credentials(
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    if not (secrets.compare_digest(username, API_USERNAME) and
+            secrets.compare_digest(password, API_PASSWORD)):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return username
 
-@app.get("/get-deployments/", tags=["Deployments"])
-async def get_deployments():
+@app.post("/get-deployments/", tags=["Deployments"])
+async def get_deployments(username: str = Depends(validate_credentials)):
     return JSONResponse(content=deployments_info)
-
 
 def increment_id(data, current_id):
     id_list = []
@@ -167,7 +195,17 @@ def increment_id(data, current_id):
 
 
 @app.post("/create-deployment/", tags=["Deployments"])
-async def create_deployment(new_deployment: NewDeployment):
+async def create_deployment(
+    country: str = Form(...),
+    country_code: str = Form(...),
+    location_name: str = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
+    camera_id: str = Form(...),
+    hardware_id: str = Form(...),
+    status: DeploymentStatus = Form(DeploymentStatus.inactive),
+    username: str = Depends(validate_credentials)
+    ):
     try:
         global deployments_info
         # Append the new deployment to the CSV file
@@ -177,17 +215,19 @@ async def create_deployment(new_deployment: NewDeployment):
             # TODO: check is camera id already exists
             system_id = increment_id(deployments_info, 'system_id')
             deployment_id = increment_id(deployments_info, 'deployment_id')
-            deployment = Deployment(country=new_deployment.country,
-                                    country_code=new_deployment.country_code,
-                                    location_name=new_deployment.location_name,
-                                    lat=new_deployment.lat,
-                                    lon=new_deployment.lon,
-                                    location_id=location_id,
-                                    camera_id=new_deployment.camera_id,
-                                    system_id=system_id,
-                                    hardware_id=new_deployment.hardware_id,
-                                    deployment_id=deployment_id,
-                                    status=new_deployment.status)
+            deployment = Deployment(
+                country=country,
+                country_code=country_code,
+                location_name=location_name,
+                lat=lat,
+                lon=lon,
+                location_id=location_id,
+                camera_id=camera_id,
+                system_id=system_id,
+                hardware_id=hardware_id,
+                deployment_id=deployment_id,
+                status=status
+            )
             fieldnames = ['country', 'country_code', 'location_name', "lat", "lon", "location_id", 'camera_id',
                           "system_id", 'hardware_id', 'deployment_id', 'status']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -201,31 +241,56 @@ async def create_deployment(new_deployment: NewDeployment):
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 
-@app.put("/update-deployment/", tags=["Deployments"])
-async def update_deployment(deployment: Deployment):
+@app.post("/update-deployment/", tags=["Deployments"])
+async def update_deployment(
+    country: str = Form(...),
+    country_code: str = Form(...),
+    location_name: str = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
+    location_id: str = Form(...),
+    camera_id: str = Form(...),
+    system_id: str = Form(...),
+    hardware_id: str = Form(...),
+    deployment_id: str = Form(...),
+    status: DeploymentStatus = Form(DeploymentStatus.inactive),
+    username: str = Depends(validate_credentials)
+):
     try:
-        # Reload deployments info
         global deployments_info
 
-        # Find the deployment to update
-        for i, existing_deployment in enumerate(deployments_info):
-            if existing_deployment['deployment_id'] == deployment.deployment_id:
-                deployments_info[i] = deployment.dict()
-                break
-            if i == len(deployments_info)-1:
-                return JSONResponse(status_code=404, content={"message": "Deployment not found"})
+        # Construct dict manually from form fields
+        updated_deployment = {
+            "country": country,
+            "country_code": country_code,
+            "location_name": location_name,
+            "lat": lat,
+            "lon": lon,
+            "location_id": location_id,
+            "camera_id": camera_id,
+            "system_id": system_id,
+            "hardware_id": hardware_id,
+            "deployment_id": deployment_id,
+            "status": status
+        }
 
-        # Write the updated deployments back to the CSV file
-        with open('deployments_info.csv', 'w', newline='') as csvfile:
-            fieldnames = ['country', 'country_code', 'location_name', "lat", "lon", "location_id", 'camera_id',
-                          "system_id", 'hardware_id', 'deployment_id', 'status']
+        for i, existing_deployment in enumerate(deployments_info):
+            if existing_deployment["deployment_id"] == deployment_id:
+                deployments_info[i] = updated_deployment
+                break
+        else:
+            return JSONResponse(status_code=404, content={"message": "Deployment not found"})
+
+        # Write back to CSV
+        with open("deployments_info.csv", "w", newline='') as csvfile:
+            fieldnames = updated_deployment.keys()
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            for dep in deployments_info:
-                writer.writerow(dep)
+            writer.writerows(deployments_info)
 
         deployments_info = load_deployments_info()
         return JSONResponse(status_code=200, content={"message": "Deployment updated successfully"})
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"message": str(e)})
 
@@ -234,7 +299,7 @@ async def update_deployment(deployment: Deployment):
 async def list_data(
         country_location_name: str = Query("", enum=sorted(list(valid_countries_location_names)),
                                            description="Country and location names."),
-        data_type: str = Query("", enum=list(valid_data_types), description="")
+        data_type: str = Query("", enum=valid_data_types, description="")
 ):
     country, location_name = country_location_name.split(" - ")
     country_code = [d['country_code'] for d in deployments_info if d['country'] == country][0]
@@ -268,7 +333,7 @@ async def list_data(
 async def count_data(
         country_location_name: str = Query("", enum=sorted(list(valid_countries_location_names)),
                                            description="Country and location names."),
-        data_type: str = Query("", enum=list(valid_data_types), description="")
+        data_type: str = Query("", enum=valid_data_types, description="")
 ):
     country, location_name = country_location_name.split(" - ")
     country_code = [d['country_code'] for d in deployments_info if d['country'] == country][0]
@@ -314,10 +379,10 @@ async def get_logs():
 
 
 @app.post("/create-bucket/", tags=["Other"])
-async def create_bucket(bucket_name: str = Query("", description="Bucket are named based on countries "
-                                                                 "Alpha-3 code, check this link: "
-                                                                 "https://www.iban.com/country-codes. "
-                                                                 "E.g. The United Kingdom would be gbr")):
+async def create_bucket(
+    bucket_name: str = Form(...),
+    username: str = Depends(validate_credentials)
+):
     async with session.client('s3',
                               aws_access_key_id=AWS_ACCESS_KEY_ID,
                               aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -335,37 +400,42 @@ async def create_bucket(bucket_name: str = Query("", description="Bucket are nam
 
 
 @app.post("/generate-presigned-url/", tags=["Data"])
-async def generate_presigned_url(
+async def generate_presigned_urls(
     name: str = Form(...),
     country: str = Form(...),
     deployment: str = Form(...),
     data_type: str = Form(...),
-    filename: str = Form(...),
-    file_type: str = Form(...)
-    ):
+    filenames: str = Form(...),  # comma-separated
+    file_types: str = Form(...),  # comma-separated
+    username: str = Depends(validate_credentials)
+):
     bucket_name = country.lower()
-    key = f"{deployment}/{data_type}/{filename}"
+    prefix = f"{deployment}/{data_type}/"
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+        endpoint_url=AWS_URL_ENDPOINT
+    )
 
-    s3 = boto3.client('s3',
-                      aws_access_key_id=AWS_ACCESS_KEY_ID,
-                      aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                      region_name=AWS_REGION,
-                      endpoint_url=AWS_URL_ENDPOINT)
+    filenames_list = filenames.split(",")
+    filetypes_list = file_types.split(",")
+
+    if len(filenames_list) != len(filetypes_list):
+        return JSONResponse(status_code=400, content={"error": "Filenames and file_types count mismatch"})
+
     try:
-        # Generate a presigned URL for the S3
-        presigned_url = s3.generate_presigned_url('put_object',
-                                                  Params={"Bucket": bucket_name,
-                                                          "Key": key,
-                                                          "ContentType": file_type},
-                                                  ExpiresIn=3600)  # URL expires in 1 hour
-
-        return JSONResponse(status_code=200, content=presigned_url)
-    except NoCredentialsError:
-        return JSONResponse(status_code=403, content={"error": "No AWS credentials found"})
-    except PartialCredentialsError:
-        return JSONResponse(status_code=403, content={"error": "Incomplete AWS credentials"})
+        urls = {}
+        for fname, ftype in zip(filenames_list, filetypes_list):
+            key = f"{prefix}{fname}"
+            presigned_url = s3.generate_presigned_url('put_object',
+                                                      Params={"Bucket": bucket_name, "Key": key, "ContentType": ftype},
+                                                      ExpiresIn=3600)
+            urls[fname] = presigned_url
+        return JSONResponse(status_code=200, content=urls)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})  
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/upload/", tags=["Data"])
 async def upload(
@@ -373,7 +443,8 @@ async def upload(
         country: str = Form(...),
         deployment: str = Form(...),
         data_type: str = Form(...),
-        files: List[UploadFile] = File(...)
+        files: List[UploadFile] = File(...),
+        username: str = Depends(validate_credentials)
 ):
     start_time = perf_counter()
     s3_bucket_name = country.lower()
@@ -393,7 +464,7 @@ async def upload(
     return JSONResponse(status_code=200, content={"message": "All files uploaded and verified successfully"})
 
 
-async def upload_file(s3_bucket_name, key, file, name):
+async def upload_file(s3_bucket_name, key, file, name, username: str = Depends(validate_credentials)):
     async with session.client('s3',
                               aws_access_key_id=AWS_ACCESS_KEY_ID,
                               aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -413,10 +484,12 @@ async def check_file_exist(
     country: str = Form(...),
     deployment: str = Form(...),
     data_type: str = Form(...),
-    filename: str = Form(...)
+    filenames: str = Form(...),
+    username: str = Depends(validate_credentials)
 ):
     bucket_name = country.lower()
-    key = f"{deployment}/{data_type}/{filename}"
+    prefix = f"{deployment}/{data_type}/"
+    filenames_list = filenames.split(",")
 
     s3 = boto3.client('s3',
                       aws_access_key_id=AWS_ACCESS_KEY_ID,
@@ -424,22 +497,22 @@ async def check_file_exist(
                       region_name=AWS_REGION,
                       endpoint_url=AWS_URL_ENDPOINT)
 
-    try:
-        s3.head_object(Bucket=bucket_name, Key=key)
-        message = {"exists": True}  # File exists
-        return JSONResponse(status_code=200, content=message)
-    except s3.exceptions.ClientError as e:
-        if e.response['Error']['Code'] == '404':
-            message = {"exists": False}  # File doesn't exist
-            return JSONResponse(status_code=200, content=message)
-        return JSONResponse(status_code=500, content={"message": f"{e}"})
-    except NoCredentialsError:
-        return JSONResponse(status_code=403, content={"message": "No AWS credentials found"})
-    except PartialCredentialsError:
-        return JSONResponse(status_code=403, content={"message": "Incomplete AWS credentials"})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"message": f"{e}"})
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        # Wrap head_object call
+        def check_key(filename):
+            key = f"{prefix}{filename}"
+            try:
+                s3.head_object(Bucket=bucket_name, Key=key)
+                return filename, True
+            except s3.exceptions.ClientError as e:
+                if e.response['Error']['Code'] == '404':
+                    return filename, False
+                else:
+                    raise
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+        tasks = [loop.run_in_executor(executor, partial(check_key, f)) for f in filenames_list]
+        results = await asyncio.gather(*tasks)
+
+    result_dict = dict(results)
+    return JSONResponse(status_code=200, content={"results": result_dict})
