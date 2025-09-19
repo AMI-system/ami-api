@@ -22,6 +22,12 @@ from typing import Annotated
 
 from enum import Enum
 
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+
+USE_LOCAL = True
+doc_path = "docs" if USE_LOCAL else "/ami-data-upload/docs"
+
 # Configure logging
 logging.basicConfig(
     filename='upload_logs.log',  # Log file path on the server
@@ -157,7 +163,7 @@ class DeploymentStatus(str, Enum):
 
 @app.get("/", include_in_schema=False)
 async def main():
-    return RedirectResponse(url="docs") # docs or /ami-data-upload/docs#
+    return RedirectResponse(url=doc_path)
 
 def validate_credentials(
     username: str = Form(...),
@@ -394,38 +400,42 @@ async def create_bucket(
 
 
 @app.post("/generate-presigned-url/", tags=["Data"])
-async def generate_presigned_url(
+async def generate_presigned_urls(
     name: str = Form(...),
     country: str = Form(...),
     deployment: str = Form(...),
     data_type: str = Form(...),
-    filename: str = Form(...),
-    file_type: str = Form(...),
+    filenames: str = Form(...),  # comma-separated
+    file_types: str = Form(...),  # comma-separated
     username: str = Depends(validate_credentials)
-    ):
+):
     bucket_name = country.lower()
-    key = f"{deployment}/{data_type}/{filename}"
+    prefix = f"{deployment}/{data_type}/"
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+        endpoint_url=AWS_URL_ENDPOINT
+    )
 
-    s3 = boto3.client('s3',
-                      aws_access_key_id=AWS_ACCESS_KEY_ID,
-                      aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                      region_name=AWS_REGION,
-                      endpoint_url=AWS_URL_ENDPOINT)
+    filenames_list = filenames.split(",")
+    filetypes_list = file_types.split(",")
+
+    if len(filenames_list) != len(filetypes_list):
+        return JSONResponse(status_code=400, content={"error": "Filenames and file_types count mismatch"})
+
     try:
-        # Generate a presigned URL for the S3
-        presigned_url = s3.generate_presigned_url('put_object',
-                                                  Params={"Bucket": bucket_name,
-                                                          "Key": key,
-                                                          "ContentType": file_type},
-                                                  ExpiresIn=3600)  # URL expires in 1 hour
-
-        return JSONResponse(status_code=200, content=presigned_url)
-    except NoCredentialsError:
-        return JSONResponse(status_code=403, content={"error": "No AWS credentials found"})
-    except PartialCredentialsError:
-        return JSONResponse(status_code=403, content={"error": "Incomplete AWS credentials"})
+        urls = {}
+        for fname, ftype in zip(filenames_list, filetypes_list):
+            key = f"{prefix}{fname}"
+            presigned_url = s3.generate_presigned_url('put_object',
+                                                      Params={"Bucket": bucket_name, "Key": key, "ContentType": ftype},
+                                                      ExpiresIn=3600)
+            urls[fname] = presigned_url
+        return JSONResponse(status_code=200, content=urls)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})  
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/upload/", tags=["Data"])
 async def upload(
@@ -474,10 +484,12 @@ async def check_file_exist(
     country: str = Form(...),
     deployment: str = Form(...),
     data_type: str = Form(...),
-    filename: str = Form(...)
+    filenames: str = Form(...),
+    username: str = Depends(validate_credentials)
 ):
     bucket_name = country.lower()
-    key = f"{deployment}/{data_type}/{filename}"
+    prefix = f"{deployment}/{data_type}/"
+    filenames_list = filenames.split(",")
 
     s3 = boto3.client('s3',
                       aws_access_key_id=AWS_ACCESS_KEY_ID,
@@ -485,22 +497,22 @@ async def check_file_exist(
                       region_name=AWS_REGION,
                       endpoint_url=AWS_URL_ENDPOINT)
 
-    try:
-        s3.head_object(Bucket=bucket_name, Key=key)
-        message = {"exists": True}  # File exists
-        return JSONResponse(status_code=200, content=message)
-    except s3.exceptions.ClientError as e:
-        if e.response['Error']['Code'] == '404':
-            message = {"exists": False}  # File doesn't exist
-            return JSONResponse(status_code=200, content=message)
-        return JSONResponse(status_code=500, content={"message": f"{e}"})
-    except NoCredentialsError:
-        return JSONResponse(status_code=403, content={"message": "No AWS credentials found"})
-    except PartialCredentialsError:
-        return JSONResponse(status_code=403, content={"message": "Incomplete AWS credentials"})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"message": f"{e}"})
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        # Wrap head_object call
+        def check_key(filename):
+            key = f"{prefix}{filename}"
+            try:
+                s3.head_object(Bucket=bucket_name, Key=key)
+                return filename, True
+            except s3.exceptions.ClientError as e:
+                if e.response['Error']['Code'] == '404':
+                    return filename, False
+                else:
+                    raise
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+        tasks = [loop.run_in_executor(executor, partial(check_key, f)) for f in filenames_list]
+        results = await asyncio.gather(*tasks)
+
+    result_dict = dict(results)
+    return JSONResponse(status_code=200, content={"results": result_dict})
